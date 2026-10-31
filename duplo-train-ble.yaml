@@ -1,0 +1,683 @@
+# Experimental LEGO DUPLO 10427 test. See README.md before enabling motion.
+# Original ESP32 DevKit / ESP32-WROOM-32 ONLY with this board setting.
+# No external components, MQTT broker, Bluetooth proxy, or server required.
+
+esphome:
+  name: duplo-train-test
+  friendly_name: DUPLO Train Test
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: VERBOSE
+  logs:
+    esp32_ble_tracker: INFO
+    sensor: INFO
+
+api:
+  encryption:
+    key: !secret duplotrain__encryption_key
+  # HA/log-viewer absence must not trigger periodic test-device reboots.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret duplotrain__ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  reboot_timeout: 0s
+  on_disconnect:
+    - script.execute: stop_now
+
+esp32_ble:
+  id: ble_stack
+  io_capability: none
+  # Automatic pairing can be disabled independently of automatic discovery.
+  auth_req_mode: bond
+
+globals:
+  - id: discovery_requested
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: candidate_seen
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: battery_reply_seen
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: rx_buffer
+    type: std::vector<uint8_t>
+    restore_value: false
+    initial_value: 'std::vector<uint8_t>{}'
+  - id: train_char_handle
+    type: uint16_t
+    restore_value: false
+    initial_value: '0'
+  - id: train_cccd_handle
+    type: uint16_t
+    restore_value: false
+    initial_value: '0'
+  - id: train_char_properties
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+
+esp32_ble_tracker:
+  id: ble_tracker
+  scan_parameters:
+    active: true
+    continuous: false
+    duration: 20s
+  on_ble_advertise:
+    then:
+      - lambda: |-
+          if (!id(discovery_requested) ||
+              id(train_ble).state() != esp32_ble_tracker::ClientState::IDLE) return;
+          bool newer_duplo = false;
+          for (const auto &md : x.get_manufacturer_datas()) {
+            if (md.uuid == esp32_ble::ESPBTUUID::from_uint16(0x0397) &&
+                md.data.size() >= 6 && md.data[1] == 0x21) {
+              newer_duplo = true;
+            }
+          }
+          bool lego_service = false;
+          const auto wanted = esp32_ble::ESPBTUUID::from_raw(
+              "00001623-1212-efde-1623-785feabcd123");
+          for (const auto &uuid : x.get_service_uuids()) {
+            if (uuid == wanted) lego_service = true;
+          }
+          if (!newer_duplo || !lego_service) return;
+          char address[18];
+          ESP_LOGI("train_scan", "Selected %s name='%s' RSSI=%d address_type=%u",
+                   x.address_str_to(address), x.get_name().c_str(), x.get_rssi(),
+                   static_cast<unsigned>(x.get_address_type()));
+          // Resolve a fresh advertisement on every discovery, not a
+          // potentially stale hard-coded private MAC. Keep other trains OFF.
+          id(train_ble).set_address(x.address_uint64());
+          id(train_ble).set_remote_addr_type(x.get_address_type());
+          id(candidate_seen) = true;
+          id(discovery_requested) = false;
+
+ble_client:
+  - id: train_ble
+    # Placeholder only; replaced from a matching live advertisement above.
+    mac_address: "00:00:00:00:00:00"
+    auto_connect: false
+    on_connect:
+      then:
+        - lambda: |-
+            // Cache numeric handles NOW: ESPHome releases discovery objects
+            // later. Do not keep characteristic pointers or look up on clicks.
+            id(train_char_handle) = 0;
+            id(train_cccd_handle) = 0;
+            id(train_char_properties) = 0;
+            auto *ch = id(train_ble).get_characteristic(
+                esp32_ble::ESPBTUUID::from_raw("00001623-1212-efde-1623-785feabcd123"),
+                esp32_ble::ESPBTUUID::from_raw("00001624-1212-efde-1623-785feabcd123"));
+            if (ch != nullptr) {
+              id(train_char_handle) = ch->handle;
+              id(train_char_properties) = ch->properties;
+              auto *cccd = ch->get_descriptor(static_cast<uint16_t>(0x2902));
+              if (cccd != nullptr) id(train_cccd_handle) = cccd->handle;
+            }
+            ESP_LOGI("train", "Cached characteristic=0x%04X CCCD=0x%04X properties=0x%02X",
+                     id(train_char_handle), id(train_cccd_handle), id(train_char_properties));
+            id(battery_reply_seen) = false;
+            id(rx_buffer).clear();
+            id(train_battery).publish_state(NAN);
+            ESP_LOGI("train", "BLE established; authentication and command execution UNVERIFIED");
+        - script.stop: connection_watchdog
+        - script.execute:
+            id: initialize_train
+            force_pairing: false
+    on_disconnect:
+      then:
+        - script.stop: connection_watchdog
+        - script.stop: discover_train
+        - script.stop: initialize_train
+        - script.stop: prepare_test
+        - script.stop: set_light_colour
+        - lambda: |-
+            id(discovery_requested) = false;
+            id(battery_reply_seen) = false;
+            id(train_char_handle) = 0;
+            id(train_cccd_handle) = 0;
+            id(train_char_properties) = 0;
+            id(rx_buffer).clear();
+            id(train_battery).publish_state(NAN);
+            ESP_LOGW("train", "BLE lost: commands cannot be sent until connected again");
+
+# Repeat discovery windows while idle, including after power-on and BLE loss.
+# Reuse manual discovery so address rotation, scan cleanup and timeouts stay
+# identical. Never start a second attempt or interrupt an established link.
+interval:
+  - interval: 2s
+    startup_delay: 2s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(auto_connection).state && id(ble_stack).is_active() &&
+                     id(train_ble).state() == esp32_ble_tracker::ClientState::IDLE &&
+                     id(train_ble).get_gattc_if() != ESP_GATT_IF_NONE &&
+                     id(ble_tracker).get_scanner_state() == esp32_ble_tracker::ScannerState::IDLE &&
+                     !id(discover_train).is_running() &&
+                     !id(connection_watchdog).is_running();
+          then:
+            - script.execute: discover_train
+
+switch:
+  - platform: template
+    id: auto_connection
+    name: Auto connect
+    icon: mdi:bluetooth-connect
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_off_action:
+      # Do nothing on an already established link. At boot both scripts are
+      # stopped, so restoring OFF does not touch the uninitialized BLE stack.
+      - if:
+          condition:
+            lambda: |-
+              return id(discover_train).is_running() ||
+                     id(connection_watchdog).is_running();
+          then:
+            - script.stop: discover_train
+            - script.stop: connection_watchdog
+            - lambda: |-
+                id(discovery_requested) = false;
+                id(candidate_seen) = false;
+            - esp32_ble_tracker.stop_scan:
+            - if:
+                condition:
+                  lambda: |-
+                    return id(train_ble).state() == esp32_ble_tracker::ClientState::CONNECTING ||
+                           id(train_ble).state() == esp32_ble_tracker::ClientState::CONNECTED;
+                then:
+                  - ble_client.disconnect: train_ble
+
+  - platform: template
+    id: auto_pairing
+    name: Auto pairing
+    icon: mdi:bluetooth-settings
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    # Only explicit pairing requests are controlled; existing bonds are kept.
+    # The next connection obeys this setting. Manual Request pairing overrides it.
+
+binary_sensor:
+  - platform: template
+    name: Train BLE connected
+    entity_category: diagnostic
+    lambda: return id(train_ble).connected();
+  - platform: template
+    name: BLE authenticated
+    entity_category: diagnostic
+    lambda: return id(train_ble).connected() && id(train_ble).is_paired();
+  - platform: template
+    name: Battery reply received
+    entity_category: diagnostic
+    lambda: return id(train_ble).connected() && id(battery_reply_seen);
+
+sensor:
+  - platform: template
+    id: train_battery
+    name: Train battery
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: ble_client
+    id: train_notifications
+    internal: true
+    type: characteristic
+    ble_client_id: train_ble
+    service_uuid: "00001623-1212-efde-1623-785feabcd123"
+    characteristic_uuid: "00001624-1212-efde-1623-785feabcd123"
+    notify: true
+    update_interval: never
+    lambda: |-
+      ESP_LOGD("train_rx", "RX %s", format_hex_pretty(x).c_str());
+      auto &buffer = id(rx_buffer);
+      // Minimal short-frame LWP parser; handles split/coalesced notifications.
+      if (buffer.size() + x.size() > 512) {
+        ESP_LOGW("train_rx", "RX overflow; discarding buffered data");
+        buffer.clear();
+        return 0.0f;
+      }
+      buffer.insert(buffer.end(), x.begin(), x.end());
+      while (!buffer.empty()) {
+        const size_t length = buffer[0];
+        if (length < 3 || length > 64) {
+          ESP_LOGW("train_rx", "Unsupported frame length %u; discarding data",
+                   static_cast<unsigned>(length));
+          buffer.clear();
+          break;
+        }
+        if (buffer.size() < length) break;
+        if (length == 6 && buffer[1] == 0x00 && buffer[2] == 0x01 &&
+            buffer[3] == 0x06 && buffer[4] == 0x06 && buffer[5] <= 100) {
+          id(train_battery).publish_state(buffer[5]);
+          id(battery_reply_seen) = true;
+          ESP_LOGI("train_rx", "Battery reply: %u%% (does not prove motor acceptance)", buffer[5]);
+        }
+        buffer.erase(buffer.begin(), buffer.begin() + length);
+      }
+      // This internal sensor transports bytes, not the public battery value.
+      return 0.0f;
+
+select:
+  - platform: template
+    id: light_colour
+    name: Requested light colour
+    icon: mdi:palette
+    # This is the last requested palette value, NOT LED-state feedback.
+    optimistic: false
+    restore_value: false
+    initial_option: "Off"
+    options:
+      - "Off"
+      - "White"
+      - "Green"
+      - "Yellow"
+      - "Light blue"
+      - "Purple"
+      - "Light pink"
+      - "Red"
+      - "Red-pink"
+      - "Purple-pink"
+      - "Dark blue"
+    set_action:
+      - script.execute:
+          id: set_light_colour
+          colour_name: !lambda return std::string(x);
+
+script:
+  # Deliberately issue WRITE WITHOUT RESPONSE, matching the train references.
+  # ESPHome's ble_write action otherwise prefers response writes if both exist.
+  # An ESP_OK return means the local BLE stack queued it, NOT train execution.
+  - id: duplo_write_packet
+    mode: single
+    parameters:
+      packet: int[]
+    then:
+      - lambda: |-
+          if (!id(train_ble).connected()) {
+            ESP_LOGW("train_tx", "Not connected; packet discarded (never replayed)");
+            return;
+          }
+          if (id(train_char_handle) == 0 || packet.empty() || packet.size() > 20 ||
+              packet[0] != static_cast<int>(packet.size())) {
+            ESP_LOGW("train_tx", "Missing characteristic or invalid packet; discarded");
+            return;
+          }
+          if ((id(train_char_properties) & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) == 0) {
+            ESP_LOGW("train_tx", "Characteristic does not advertise write-without-response");
+            return;
+          }
+          for (int value : packet) {
+            if (value < 0 || value > 255) {
+              ESP_LOGW("train_tx", "Invalid byte; packet discarded");
+              return;
+            }
+          }
+          std::vector<uint8_t> bytes(packet.begin(), packet.end());
+          const auto err = esp_ble_gattc_write_char(
+              id(train_ble).get_gattc_if(), id(train_ble).get_conn_id(), id(train_char_handle),
+              static_cast<uint16_t>(bytes.size()), bytes.data(),
+              ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("train_tx", "TX %s -> %s (queue result, NOT physical acknowledgment)",
+                   format_hex_pretty(bytes).c_str(), esp_err_to_name(err));
+
+  - id: discover_train
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(ble_stack).is_active() ||
+                     id(train_ble).state() != esp32_ble_tracker::ClientState::IDLE ||
+                     id(train_ble).get_gattc_if() == ESP_GATT_IF_NONE;
+          then:
+            - logger.log: "BLE client connected or busy; use Disconnect before rediscovery"
+          else:
+            - lambda: |-
+                id(candidate_seen) = false;
+                id(discovery_requested) = true;
+                ESP_LOGI("train_scan", "Scanning for 20s for a powered-on newer DUPLO train");
+            - esp32_ble_tracker.start_scan:
+                continuous: false
+            - wait_until:
+                condition:
+                  lambda: return id(candidate_seen);
+                timeout: 20s
+            - lambda: id(discovery_requested) = false;
+            - esp32_ble_tracker.stop_scan:
+            - wait_until:
+                condition:
+                  lambda: |-
+                    return id(ble_tracker).get_scanner_state() ==
+                        esp32_ble_tracker::ScannerState::IDLE;
+                timeout: 5s
+            - if:
+                condition:
+                  lambda: |-
+                    return id(candidate_seen) &&
+                        id(train_ble).state() == esp32_ble_tracker::ClientState::IDLE &&
+                        id(ble_tracker).get_scanner_state() == esp32_ble_tracker::ScannerState::IDLE;
+                then:
+                  # Also recover if GATT open fails locally without emitting
+                  # the completion event awaited by the stock connect action.
+                  - script.execute: connection_watchdog
+                  - ble_client.connect: train_ble
+                else:
+                  - logger.log:
+                      level: INFO
+                      format: "No matching train or scan did not stop; Auto connect will retry while enabled"
+
+  - id: connection_watchdog
+    mode: restart
+    then:
+      - delay: 20s
+      - script.stop: discover_train
+      - lambda: |-
+          id(discovery_requested) = false;
+          id(candidate_seen) = false;
+          ESP_LOGW("train", "Connection timed out; Discover can be retried once BLE returns to idle");
+      - if:
+          condition:
+            lambda: return id(train_ble).state() != esp32_ble_tracker::ClientState::IDLE;
+          then:
+            - ble_client.disconnect: train_ble
+
+  - id: stop_now
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: return id(train_ble).connected();
+          then:
+            - script.execute:
+                id: duplo_write_packet
+                packet: [0x08, 0x00, 0x81, 0x32, 0x11, 0x51, 0x00, 0x00]
+
+  - id: initialize_train
+    mode: restart
+    parameters:
+      force_pairing: bool
+    then:
+      - script.stop: prepare_test
+      - script.stop: set_light_colour
+      - script.execute: stop_now
+      - lambda: |-
+          id(battery_reply_seen) = false;
+          id(train_battery).publish_state(NAN);
+      # Let service/notification registration finish before requesting security.
+      - delay: 250ms
+      - lambda: |-
+          if (id(train_ble).connected() && !id(train_ble).is_paired() &&
+              (force_pairing || id(auto_pairing).state)) {
+            const auto err = id(train_ble).pair();
+            ESP_LOGI("train", "%s pairing request: %s (await authentication)",
+                     force_pairing ? "Manual" : "Automatic", esp_err_to_name(err));
+          }
+      - wait_until:
+          condition:
+            lambda: |-
+              return !id(train_ble).connected() || id(train_ble).is_paired() ||
+                     (!force_pairing && !id(auto_pairing).state);
+          timeout: 15s
+      - if:
+          condition:
+            lambda: return id(train_ble).connected() && id(train_ble).is_paired();
+          then:
+            - logger.log: "BLE authenticated; preparing notifications and battery automatically"
+            - script.execute: prepare_test
+          else:
+            - logger.log:
+                level: WARN
+                format: "Authentication not completed (Auto pairing may be off). Use Request pairing to authenticate manually."
+
+  - id: prepare_test
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return id(train_ble).connected();
+          then:
+            - script.execute: stop_now
+            - lambda: |-
+                id(battery_reply_seen) = false;
+                id(rx_buffer).clear();
+                id(train_battery).publish_state(NAN);
+                // Retry CCCD after pairing: stock notification setup
+                // can race authentication and does not automatically retry.
+                if (id(train_cccd_handle) == 0) {
+                  ESP_LOGW("train", "CCCD not found; inspect service discovery logs");
+                } else {
+                  uint8_t enabled[] = {0x01, 0x00};
+                  const auto err = esp_ble_gattc_write_char_descr(
+                      id(train_ble).get_gattc_if(), id(train_ble).get_conn_id(),
+                      id(train_cccd_handle), sizeof(enabled), enabled,
+                      ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+                  ESP_LOGI("train", "Enable notifications: %s (request only)", esp_err_to_name(err));
+                }
+            - delay: 500ms
+            - script.execute:
+                id: duplo_write_packet
+                packet: [0x05, 0x00, 0x01, 0x06, 0x05]
+            - wait_until:
+                condition:
+                  lambda: return id(battery_reply_seen);
+                timeout: 5s
+            - if:
+                condition:
+                  lambda: return id(battery_reply_seen);
+                then:
+                  - logger.log: "Battery reply verified. Forward, Reverse and Boost are available without arming."
+                else:
+                  - logger.log:
+                      level: WARN
+                      format: "No battery reply: use Request pairing to retry initialization; save RX/auth logs"
+          else:
+            - logger.log:
+                level: WARN
+                format: "Connect before preparing notifications"
+
+  - id: set_light_colour
+    mode: restart
+    parameters:
+      colour_name: string
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(train_ble).connected() && id(train_ble).is_paired() &&
+                     id(light_colour).index_of(colour_name).has_value();
+          then:
+            # Set up the documented sound/light EVENTS mode for each request,
+            # so no separate diagnostic button is needed before using colours.
+            - script.execute:
+                id: duplo_write_packet
+                packet: [0x0A, 0x00, 0x41, 0x34, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01]
+            - delay: 150ms
+            - if:
+                condition:
+                  lambda: return id(train_ble).connected() && id(train_ble).is_paired();
+                then:
+                  - script.execute:
+                      id: duplo_write_packet
+                      packet: !lambda |-
+                        // New 10427 EVENTS palette, not the older LPF2 palette.
+                        // Same ordering as the select options above.
+                        static const uint8_t palette[] = {
+                            0x00, 0x01, 0x07, 0x08, 0x09, 0x0A,
+                            0x0B, 0x0C, 0x0D, 0x0E, 0x0F};
+                        const auto index = id(light_colour).index_of(colour_name);
+                        if (!index.has_value() || *index >= sizeof(palette))
+                          return std::vector<int>{};
+                        return std::vector<int>{0x0B, 0x00, 0x81, 0x34, 0x11, 0x51,
+                                                0x01, 0x04, 0x01, palette[*index], 0x00};
+                  - lambda: |-
+                      id(light_colour).publish_state(colour_name);
+                      ESP_LOGI("train", "Requested light colour: %s (not LED-state feedback)", colour_name.c_str());
+          else:
+            - logger.log:
+                level: WARN
+                format: "Colour request refused: connect and complete pairing first"
+
+  # Continuous motor command: no arming, battery prerequisite, timeout or queue.
+  # A new button press changes power immediately; Stop sends motor power zero.
+  - id: set_motor_power
+    mode: restart
+    parameters:
+      power: int
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(train_ble).connected() && id(train_ble).is_paired() &&
+                     power >= -100 && power <= 100;
+          then:
+            # A user's movement command supersedes pending initialization;
+            # otherwise a later preparation step could send an unexpected Stop.
+            - script.stop: initialize_train
+            - script.stop: prepare_test
+            - script.execute:
+                id: duplo_write_packet
+                packet: !lambda |-
+                  return std::vector<int>{0x08, 0x00, 0x81, 0x32, 0x11, 0x51,
+                                          0x00, power < 0 ? 256 + power : power};
+          else:
+            - logger.log:
+                level: WARN
+                format: "Motor command not sent: connect and complete pairing first (power range -100..100)"
+
+button:
+  - platform: template
+    name: Discover and connect
+    on_press:
+      - script.execute: discover_train
+
+  - platform: template
+    name: Request pairing
+    on_press:
+      - if:
+          condition:
+            lambda: return id(train_ble).connected();
+          then:
+            - script.execute:
+                id: initialize_train
+                force_pairing: true
+          else:
+            - logger.log:
+                level: WARN
+                format: "Connect before requesting pairing"
+
+  - platform: template
+    name: Prepare notifications and battery
+    on_press:
+      - script.execute: prepare_test
+
+  - platform: template
+    name: Request battery
+    on_press:
+      - script.execute:
+          id: duplo_write_packet
+          packet: [0x05, 0x00, 0x01, 0x06, 0x05]
+
+  - platform: template
+    name: Forward
+    on_press:
+      - script.execute:
+          id: set_motor_power
+          power: 50
+
+  - platform: template
+    name: Reverse
+    on_press:
+      - script.execute:
+          id: set_motor_power
+          power: -50
+
+  - platform: template
+    name: Boost
+    icon: mdi:fast-forward
+    on_press:
+      - script.execute:
+          id: set_motor_power
+          power: 75
+
+  - platform: template
+    name: Stop
+    icon: mdi:stop-circle
+    on_press:
+      - script.stop: initialize_train
+      - script.stop: prepare_test
+      - script.execute: stop_now
+
+  - platform: template
+    name: Disconnect
+    on_press:
+      # Prevent immediately reconnecting after an intentional disconnect.
+      # Turn Auto connect back on to resume background discovery.
+      - switch.turn_off: auto_connection
+      - script.stop: discover_train
+      - script.stop: connection_watchdog
+      - script.stop: initialize_train
+      - script.stop: prepare_test
+      - script.stop: set_light_colour
+      - lambda: id(discovery_requested) = false;
+      - esp32_ble_tracker.stop_scan:
+      - script.execute: stop_now
+      - delay: 150ms
+      - ble_client.disconnect: train_ble
+
+  # Explicit diagnostic: not assumed to be required for motor control.
+  - platform: template
+    name: Enable EVENTS mode
+    on_press:
+      - script.execute:
+          id: duplo_write_packet
+          packet: [0x0A, 0x00, 0x41, 0x34, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01]
+
+  - platform: template
+    name: Test horn
+    on_press:
+      - script.execute:
+          id: duplo_write_packet
+          packet: [0x0B, 0x00, 0x81, 0x34, 0x11, 0x51, 0x01, 0x07, 0x01, 0x00, 0x00]
+
+  - platform: template
+    name: Test light index 07
+    on_press:
+      - select.set:
+          id: light_colour
+          option: "Green"
+
+  - platform: template
+    name: Next light colour
+    icon: mdi:palette
+    on_press:
+      - select.next:
+          id: light_colour
+          cycle: true
+
+  - platform: template
+    name: Light off
+    on_press:
+      - select.set:
+          id: light_colour
+          option: "Off"
